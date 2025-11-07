@@ -3,7 +3,7 @@
 #  filtering_decomposition_v4.sh
 #  BLuSH-style fMRI preprocessing + decomposition + HTML summary
 #
-#  Author: Naman Jain + ChatGPT co-dev
+#  Author: Soner Caner Cagun + ChatGPT co-dev
 #  Version: v4 (2025-11-07)
 # =====================================================================
 
