@@ -347,57 +347,19 @@ done
 while true; do
   echo -e "${PURPLE}${BOLD}STEP 5: DECOMPOSITION${RESET}"
   center_line "Decompose signal via PCA/ICA/PLS; drop unwanted components"
-
   echo "1) PCA (variance-based denoising)"
-  echo "2) Temporal ICA (time-course independence)"
-  echo "3) Spatial ICA (spatial independence)"
-  echo "4) PLS (regressor-driven)"
-  echo "5) Generate another SCM (same as Step 3)"
-  echo "6) Exit"
-
-  read -p "Choice [1–6]: " CH
-
-  # -----------------------------------------
-  # OPTION 5 → direct SCM generation
-  # -----------------------------------------
-  if [[ "$CH" == "5" ]]; then
-      echo -e "${PURPLE}${BOLD}STEP 5 → Generate SCM (same as Step 3)${RESET}"
-      AVAILABLE=($(ls -tr cleaned_mc_func.nii.gz trimmed_*.nii.gz spatial_smoothed_*.nii.gz temporal_smoothed_*.nii.gz soner_pipeline/detrended/*.nii.gz soner_pipeline/filtering/*.nii.gz soner_pipeline/pca_outputs/*/*denoised_*.nii.gz 2>/dev/null))
-      for i in "${!AVAILABLE[@]}"; do printf "%3d) %s\n" $((i+1)) "${AVAILABLE[$i]}"; done
-      read -p "Select file for SCM [1-${#AVAILABLE[@]}]: " idx
-      SCMF="${AVAILABLE[$((idx-1))]}"
-
-      plot_global_signal "$SCMF" "$MASK" "$TR"
-
-      read -p "Baseline vols (start end): " B1 B2
-      read -p "Signal vols (start end): " S1 S2
-
-      ODIR="soner_pipeline/scm_outputs/manualSCM_B${B1}-${B2}_S${S1}-${S2}_$(timestamp)"
-      mkdir -p "$ODIR"
-      scm_blush_fast "$SCMF" "$B1" "$B2" "$S1" "$S2" "$MASK" "$ODIR"
-
-      echo "[OK] SCM generated → $ODIR"
-
-      nohup fsleyes "$ODIR/norm_func_${B1}_${B2}.nii.gz" \
-                    "$ODIR/baseline_${B1}_${B2}.nii.gz" \
-                    "$ODIR/signal_change_map_${B1}_${B2}_${S1}_${S2}.nii.gz" >/dev/null 2>&1 &
-      continue
-  fi
-
-  # -----------------------------------------
-  # OPTION 6 → exit
-  # -----------------------------------------
-  [[ "$CH" == "6" ]] && break
-
-  # -----------------------------------------
-  # Normal decomposition options (1–4)
-  # -----------------------------------------
+  echo "2) Temporal ICA (independent time courses)"
+  echo "3) Spatial ICA (independent spatial maps)"
+  echo "4) PLS (stimulus-correlated components)"
+  echo "5) Exit"
+  read -p "Choice [1–5]: " CH
+  [[ "$CH" == "5" ]] && break
   case "$CH" in
-      1) METHOD="pca";;
-      2) METHOD="tica";;
-      3) METHOD="sica";;
-      4) METHOD="pls";;
-      *) continue;;
+    1) METHOD="pca";;
+    2) METHOD="tica";;
+    3) METHOD="sica";;
+    4) METHOD="pls";;
+    *) continue;;
   esac
 
   AVAILABLE=($(ls -tr cleaned_mc_func.nii.gz trimmed_*.nii.gz spatial_smoothed_*.nii.gz temporal_smoothed_*.nii.gz soner_pipeline/detrended/*.nii.gz soner_pipeline/filtering/*.nii.gz 2>/dev/null))
@@ -417,27 +379,29 @@ while true; do
   [[ "$TMP" == *"bp_"* ]] && SUB="bp"
   [[ "$TMP" == *"detrended"* ]] && SUB="detrended"
   [[ "$TMP" == trimmed_* ]] && SUB="trim"
-  [[ "$TMP" == temporal_smoothed_* || "$TMP" == spatial_smoothed_* ]] && SUB="smoothed"
+  [[ "$TMP" == spatial_smoothed_* || "$TMP" == temporal_smoothed_* ]] && SUB="smoothed"
 
+  # QC before decomp
   save_global_png "$TMP" "$MASK" "$TR" "${METHOD}_before"
   save_spectra     "$TMP" "$MASK" "$TR" "${METHOD}_before"
 
   run_decomposition "$TMP" "$METHOD" "$SUB" "$DS1" "$DS2"
-
-  DEN=$(ls -t soner_pipeline/pca_outputs/${SUB}/${SUB}_${METHOD}_func_denoised_*.nii.gz | head -n1)
+  DEN=$(ls -t "soner_pipeline/pca_outputs/${SUB}/${SUB}_${METHOD}_func_denoised_"*.nii.gz 2>/dev/null | head -n1)
   [[ -f "$DEN" ]] || { echo "[ERR] No denoised file found."; continue; }
 
+  # --- NEW: show global mean interactively after decomposition ---
   plot_global_signal "$DEN" "$MASK" "$TR"
   save_global_png "$DEN" "$MASK" "$TR" "${METHOD}_after"
   save_spectra     "$DEN" "$MASK" "$TR" "${METHOD}_after"
 
-  echo -e "\n${BLUE}${BOLD}Define baseline and signal windows:${RESET}"
+  echo -e "\n${BLUE}${BOLD}Define baseline and signal windows for denoised global mean:${RESET}"
   read -p "Baseline vols (start end): " XB1 XB2
   read -p "Signal vols (start end): " XS1 XS2
 
   OUTD="soner_pipeline/scm_outputs/${SUB}_${METHOD}_B${XB1}-${XB2}_S${XS1}-${XS2}_$(timestamp)"
   scm_blush_fast "$DEN" "$XB1" "$XB2" "$XS1" "$XS2" "$MASK" "$OUTD"
 
+  # Correct FSLeyes order: norm_func (bottom) → baseline → signal_change_map (top)
   nohup fsleyes "$OUTD/norm_func_${XB1}_${XB2}.nii.gz" \
                 "$OUTD/baseline_${XB1}_${XB2}.nii.gz" \
                 "$OUTD/signal_change_map_${XB1}_${XB2}_${XS1}_${XS2}.nii.gz" >/dev/null 2>&1 &
@@ -445,7 +409,6 @@ while true; do
   read -p "Run another decomposition? (y/n): " AGAIN
   [[ "$AGAIN" != "y" ]] && break
 done
-
 # --- HTML QC Summary (lists all QC PNGs) -------------------------------
 echo -e "${BLUE}${BOLD}Generating HTML QC summary…${RESET}"
 python3 <<'PY'
