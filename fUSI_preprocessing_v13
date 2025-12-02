@@ -1,0 +1,1190 @@
+#!/bin/bash
+
+###############################################################################
+# fUSI PREPROCESSING PIPELINE — v11 (FULL RESTRUCTURE)
+# Steps 0–4 — MATLAB→NIfTI, LocalCopy, Mean, Mask
+###############################################################################
+
+# Allow resume
+if [[ "$1" == "--continue-from-step" ]]; then
+    CONTINUE_FROM="$2"
+fi
+
+# Strict mode
+set -Eeuo pipefail
+trap 'echo -e "\n[ERROR] Failed at line $LINENO" >&2' ERR
+export LC_NUMERIC=C
+export PYTHONWARNINGS="ignore"
+shopt -s extglob
+
+###############################################################################
+# COLORS
+###############################################################################
+RED="\033[38;5;160m"
+GREEN="\033[92m"
+BLUE="\033[38;5;33m"
+PURPLE="\033[38;5;135m"
+CYAN="\033[96m"
+YELLOW="\033[38;5;220m"
+RESET="\033[0m"
+BOLD="\033[1m"
+
+###############################################################################
+# HELPERS
+###############################################################################
+center() {
+    local msg="$1"
+    printf "\n${BOLD}${PURPLE}%*s${RESET}\n" $(( (${#msg}+80)/2 )) "$msg"
+}
+
+timestamp(){ date +"%Y%m%d_%H%M%S"; }
+msg_info(){ echo -e "${BLUE}[INFO]${RESET} $1"; }
+msg_ok(){   echo -e "${GREEN}[OK]${RESET}  $1"; }
+msg_skip(){ echo -e "${CYAN}[SKIP]${RESET} $1"; }
+msg_warn(){ echo -e "${YELLOW}[WARN]${RESET} $1"; }
+msg_fail(){ echo -e "${RED}[FAIL]${RESET} $1"; }
+
+###############################################################################
+# VALIDATION
+###############################################################################
+if ! command -v python3 >/dev/null; then msg_fail "Python3 missing"; exit 1; fi
+if ! command -v fsleyes >/dev/null; then msg_warn "FSLeyes not installed"; fi
+
+###############################################################################
+# STEP 0 — SELECT RAW MATLAB FILE
+###############################################################################
+center "STEP 0 — SELECT RAW MATLAB FILE"
+echo -e "${BOLD}Why?${RESET} Load original fUSI MATLAB file (contains I, metadata)."
+
+LOADDIR="/run/user/3258/gvfs/smb-share:server=wks3,share=pr_ohlendorf/fUS/"
+RAW_MAT=$(zenity --file-selection --title="Select fUSI .mat file" --filename="$LOADDIR/")
+
+[[ -z "$RAW_MAT" ]] && echo "No input file selected." && exit 1
+
+MATNAME=$(basename "$RAW_MAT" .mat)
+RAWDIR=$(dirname "$RAW_MAT")
+
+SESSION_ANALYSED=$(echo "$RAWDIR" | sed 's/RawData/AnalysedData/')
+mkdir -p "$SESSION_ANALYSED"
+
+RAW_FINAL="${SESSION_ANALYSED}/FUS_raw_orient.nii.gz"
+
+msg_ok "Analysed output directory: $SESSION_ANALYSED"
+
+###############################################################################
+# STEP 1 — MATLAB → NIfTI (correct dims + auto-skip)
+###############################################################################
+center "STEP 1 — MATLAB → NIfTI"
+echo -e "${BOLD}Why?${RESET} Convert MATLAB fUS array into correctly oriented NIfTI."
+
+if [[ -f "$RAW_FINAL" ]]; then
+    msg_skip "Oriented NIfTI already exists → $RAW_FINAL"
+else
+    msg_info "Creating new oriented NIfTI…"
+
+    TMPFILE="/tmp/fusi_raw_$(timestamp).nii.gz"
+
+python3 <<PY
+import numpy as np
+import nibabel as nib
+import scipy.io as sio
+
+mat = sio.loadmat("$RAW_MAT")
+if "I" not in mat:
+    raise SystemExit("MAT file missing variable 'I'")
+
+I = np.array(mat["I"], dtype=np.float32)
+print("Original shape:", I.shape)
+
+# MATLAB dims = (Z,X,T) or (Z,Y,X,T)
+if I.ndim == 3:
+    Z,X,T = I.shape
+    I4 = I[:,None,:,:]
+elif I.ndim == 4:
+    Z,Y,X,T = I.shape
+    I4 = I
+else:
+    raise SystemExit("Incompatible dimensions")
+
+# Rotate 90° clockwise: (Z,X) → (X,Z)
+I_rot = np.zeros((X,1,Z,T), dtype=np.float32)
+for t in range(T):
+    sl = I4[:,0,:,t]
+    sl_rot = np.rot90(sl, -1)
+    I_rot[:,0,:,t] = sl_rot
+
+dx, dy, dz = 0.045, 1.0, 0.045
+aff = np.eye(4)
+aff[0,0] = dx
+aff[1,1] = dy
+aff[2,2] = dz
+
+nii = nib.Nifti1Image(I_rot, aff)
+nii.header.set_zooms((dx,dy,dz,1.0))
+nib.save(nii, "$TMPFILE")
+
+print("Saved:", "$TMPFILE")
+PY
+
+    cp "$TMPFILE" "$RAW_FINAL"
+    msg_ok "Final NIfTI → $RAW_FINAL"
+fi
+
+###############################################################################
+# STEP 2 — LOCAL COPY TO /tmp (FAST)
+###############################################################################
+center "STEP 2 — LOCAL COPY"
+echo -e "${BOLD}Why?${RESET} Avoid slow SMB performance."
+
+WORK="/tmp/fusi_run_$(timestamp)"
+mkdir -p "$WORK"
+
+cp "$RAW_FINAL" "$WORK/FUS_raw_orient.nii.gz"
+RAW_LOCAL="$WORK/FUS_raw_orient.nii.gz"
+
+msg_ok "Local copy created → $RAW_LOCAL"
+
+###############################################################################
+# STEP 3 — MEAN IMAGE (AUTO-SKIP)
+###############################################################################
+center "STEP 3 — MEAN IMAGE"
+echo -e "${BOLD}Why?${RESET} Required for mask drawing + QC + template building."
+
+MEAN_O="${SESSION_ANALYSED}/mean_FUS_raw_orient.nii.gz"
+
+if [[ -f "$MEAN_O" ]]; then
+    msg_skip "Mean image exists → $MEAN_O"
+else
+    msg_info "Computing mean image…"
+
+python3 <<PY
+import nibabel as nib, numpy as np
+img = nib.load("$RAW_LOCAL")
+d   = img.get_fdata()
+mn  = d.mean(axis=-1)
+nib.save(nib.Nifti1Image(mn.astype(np.float32), img.affine, img.header), "$MEAN_O")
+PY
+
+    msg_ok "Saved → $MEAN_O"
+fi
+
+
+###############################################################################
+# STEP 4 — MANUAL / OTSU MASKING (reverted version)
+###############################################################################
+center "STEP 4 — MASK CREATION"
+echo -e "${BOLD}Why?${RESET} Brain mask removes edges + noise."
+
+MASK_O="${SESSION_ANALYSED}/mask_FUS_raw_orient.nii.gz"
+PREMASK="${SESSION_ANALYSED}/premask_STRICT_otsu.nii.gz"
+
+# -------------------------------------------------------------------------
+# If user already has a mask saved → automatically skip this step
+# -------------------------------------------------------------------------
+if [[ -f "$MASK_O" ]]; then
+    msg_ok "Mask already exists → $MASK_O"
+    msg_ok "Skipping STEP 4."
+    return
+fi
+
+echo
+echo "Masking options:"
+echo "A) Manual only (recommended for clean control)"
+echo "B) Auto Otsu STRICT → manual correction"
+read -p "Choose option (A/B): " MASKOPT
+echo
+
+# -------------------------------------------------------------------------
+# OPTION B → Auto strict Otsu (same as your old v1 logic)
+# -------------------------------------------------------------------------
+if [[ "$MASKOPT" =~ ^[Bb]$ ]]; then
+    msg_info "Generating STRICT Otsu premask…"
+
+    python3 <<PY
+import nibabel as nib
+import numpy as np
+from scipy.ndimage import label, binary_fill_holes, binary_dilation
+
+mean_path = "$MEAN_O"
+print("Loading:", mean_path)
+
+img = nib.load(mean_path)
+d = img.get_fdata().astype(np.float32)
+d = np.nan_to_num(d)
+
+vals = d[d > 0].ravel()
+hist, bin_edges = np.histogram(vals, bins=256)
+p = hist.astype(float) / hist.sum()
+
+w = np.cumsum(p)
+m = np.cumsum(p * np.arange(256))
+mg = m[-1]
+bcv = (mg * w - m)**2 / (w * (1 - w) + 1e-12)
+bcv[w * (1 - w) == 0] = 0
+k = np.argmax(bcv)
+thr = bin_edges[k]
+
+mask = d > thr
+lab, num = label(mask)
+if num > 1:
+    sizes = [(lab == i).sum() for i in range(1, num+1)]
+    mask = (lab == 1 + np.argmax(sizes))
+
+mask = binary_dilation(mask, iterations=1)
+mask = binary_fill_holes(mask)
+
+out = (mask.astype(np.uint8) * 255)
+nib.save(nib.Nifti1Image(out, img.affine, img.header), "$PREMASK")
+PY
+
+    msg_ok "Premask created → $PREMASK"
+    OPEN_MASK="$PREMASK"
+
+else
+    # --------------------------------------------------------------
+    # OPTION A → Manual only: open empty MEAN image, no premask
+    # --------------------------------------------------------------
+    msg_info "Manual masking selected."
+    OPEN_MASK=""
+fi
+
+# -------------------------------------------------------------------------
+# Open FSLeyes for manual drawing
+# -------------------------------------------------------------------------
+msg_info "Opening FSLeyes: MEAN + (optional) premask"
+if [[ -n "$OPEN_MASK" ]]; then
+    nohup fsleyes "$MEAN_O" "$OPEN_MASK" >/dev/null 2>&1 &
+else
+    nohup fsleyes "$MEAN_O" >/dev/null 2>&1 &
+fi
+
+echo
+echo -e "${PURPLE}[ACTION REQUIRED]${RESET}"
+echo "Draw the mask in FSLeyes and SAVE AS:"
+echo -e "${YELLOW}$MASK_O${RESET}"
+echo
+
+# -------------------------------------------------------------------------
+# Wait until user saves mask_FUS_raw_orient.nii.gz
+# -------------------------------------------------------------------------
+while [[ ! -f "$MASK_O" ]]; do
+    sleep 2
+done
+
+msg_ok "Mask saved → $MASK_O"
+
+
+
+###############################################################################
+# PART 1 COMPLETE
+###############################################################################
+msg_ok "Part 1/4 complete — ready for Step 5."
+###############################################################################
+# STEP 5 — CLEAN TIMESERIES
+###############################################################################
+center "STEP 5 — CLEAN TIMESERIES"
+echo -e "${BOLD}Why?${RESET} Apply mask to remove non-brain voxels."
+
+CLEAN_O="${SESSION_ANALYSED}/cleaned_FUS_raw_orient.nii.gz"
+
+if [[ -f "$CLEAN_O" ]]; then
+    msg_skip "Cleaned dataset already exists → $CLEAN_O"
+else
+    msg_info "Applying mask to 4D dataset…"
+
+python3 <<PY
+import nibabel as nib, numpy as np
+
+raw = nib.load("$RAW_LOCAL")
+mask = nib.load("$MASK_O").get_fdata() > 0
+
+data = raw.get_fdata()
+clean = data * mask[..., None]         # broadcast mask
+
+nib.save(
+    nib.Nifti1Image(clean.astype(np.float32), raw.affine, raw.header),
+    "$CLEAN_O"
+)
+PY
+
+    msg_ok "Saved cleaned dataset → $CLEAN_O"
+fi
+
+###############################################################################
+# STEP 6 — ADVANCED QC
+###############################################################################
+center "STEP 6 — ADVANCED QC"
+echo -e "${BOLD}Why?${RESET} Compute frequency, spatial, temporal QC metrics (SNR, CNR, DVARS, rGS …)."
+
+QC_DIR="${SESSION_ANALYSED}/QC"
+mkdir -p "$QC_DIR"
+
+FREQ_PNG="$QC_DIR/freq_qc.png"
+TEMP_PNG="$QC_DIR/temporal_qc.png"
+SPATIAL_PNG="$QC_DIR/spatial_qc.png"
+TSNR_PNG="$QC_DIR/tsnr_qc.png"
+SNR_PNG="$QC_DIR/snr_cnr_qc.png"
+QC_TXT="$QC_DIR/qc_values.txt"
+
+RAW_FINAL="${SESSION_ANALYSED}/FUS_raw_orient.nii.gz"
+
+# If ALL QC PNGs exist → SKIP
+if [[ -f "$FREQ_PNG" && -f "$TEMP_PNG" && -f "$SPATIAL_PNG" && -f "$TSNR_PNG" && -f "$SNR_PNG" ]]; then
+    msg_skip "All QC outputs present → Step 6 skipped."
+else
+    msg_info "Displaying global signal to set QC windows…"
+
+python3 <<PY
+import nibabel as nib, numpy as np, matplotlib.pyplot as plt
+
+img = nib.load("$CLEAN_O")
+d = img.get_fdata()
+gs = d.reshape(-1, d.shape[-1]).mean(0)
+
+plt.figure(figsize=(12,4))
+plt.plot(gs, "k")
+plt.title("Global Mean — choose baseline / injection / post windows")
+plt.xlabel("Volume")
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+PY
+
+    read -p "Baseline start end (volumes): " B1 B2
+    read -p "Injection start end (volumes): " S1 S2
+    read -p "Post-injection start end (volumes): " P1 P2
+
+    msg_info "Running QC computations…"
+
+python3 <<PY
+###############################################################################
+# Python QC Engine
+###############################################################################
+import os, numpy as np, nibabel as nib
+import matplotlib.pyplot as plt
+from scipy.fft import rfft, rfftfreq
+from numpy import interp
+
+# Load dataset
+img = nib.load("$CLEAN_O")
+d   = img.get_fdata()       # X,Y,Z,T
+X,Y,Z,T = d.shape
+flat = d.reshape(-1, T)
+TR = img.header.get_zooms()[3]
+
+# Load RAW (for raw SNR)
+if os.path.exists("$RAW_FINAL"):
+    raw = nib.load("$RAW_FINAL").get_fdata()
+else:
+    raw = d.copy()
+
+# Windows
+B1,B2 = map(int, ["$B1", "$B2"])
+S1,S2 = map(int, ["$S1", "$S2"])
+P1,P2 = map(int, ["$P1", "$P2"])
+
+windows = {
+    "Baseline":  flat[:, B1:B2+1],
+    "Injection": flat[:, S1:S2+1],
+    "Post":      flat[:, P1:P2+1],
+}
+
+###############################################################################
+# FREQUENCY QC (0–2 Hz)
+###############################################################################
+fft_data, freq_data = {}, {}
+
+for name, seg in windows.items():
+    mean_ts = seg.mean(0)
+    spec = np.abs(rfft(mean_ts))
+    freqs = rfftfreq(len(mean_ts), TR)
+    mask = freqs <= 2.0
+    fft_data[name] = spec[mask]
+    freq_data[name] = freqs[mask]
+
+# Interpolate onto common axis
+df = min(np.diff(v)[0] for v in freq_data.values())
+freqs_common = np.arange(0, 2.0 + df, df)
+
+interp_spec = {
+    name: interp(freqs_common, freq_data[name], fft_data[name])
+    for name in fft_data
+}
+
+plt.figure(figsize=(14,8))
+for i,key in enumerate(["Baseline","Injection","Post"]):
+    plt.subplot(3,1,i+1)
+    plt.plot(freqs_common, interp_spec[key])
+    plt.title(f"{key} FFT (0–2 Hz)")
+    plt.xlabel("Hz")
+    plt.grid(alpha=0.2)
+plt.tight_layout()
+plt.savefig("$FREQ_PNG", dpi=150)
+plt.close()
+
+###############################################################################
+# SPATIAL QC
+###############################################################################
+pd_mean = d.mean(-1)
+pd_std  = d.std(-1)
+temporal_cv = pd_std / (pd_mean + 1e-6)
+
+vel = np.diff(d, axis=-1)
+axial_vel = vel.mean(-1)
+
+pd_val = float(pd_mean.mean())
+cv_val = float(temporal_cv.mean())
+axial_val = float(axial_vel.mean())
+
+plt.figure(figsize=(14,8))
+plt.subplot(3,1,1); plt.hist(pd_mean.reshape(-1), bins=80); plt.title("Mean Power Doppler")
+plt.subplot(3,1,2); plt.hist(temporal_cv.reshape(-1), bins=80); plt.title("Temporal CV")
+plt.subplot(3,1,3); plt.hist(axial_vel.reshape(-1), bins=80); plt.title("Axial Velocity Surrogate")
+plt.tight_layout()
+plt.savefig("$SPATIAL_PNG", dpi=150)
+plt.close()
+
+###############################################################################
+# TEMPORAL QC: GS, rGS, DVARS, rDVARS
+###############################################################################
+gs = flat.mean(0)
+D1 = np.percentile(gs, 10)
+rGS = 100 * (gs - D1) / (D1 + 1e-6)
+
+diff = np.diff(flat, 1, 1)
+DVARS = np.sqrt((diff**2).mean(0))
+
+# rDVARS null mean
+p25,p75 = np.percentile(flat,[25,75], axis=1)
+iqr = p75 - p25
+sigma = iqr / 1.349
+mu0 = np.sqrt((2*sigma**2).mean())
+rDVARS = DVARS / (mu0 + 1e-6)
+
+plt.figure(figsize=(14,10))
+plt.subplot(4,1,1); plt.plot(gs); plt.title("GS")
+plt.subplot(4,1,2); plt.plot(rGS); plt.title("rGS")
+plt.subplot(4,1,3); plt.plot(DVARS); plt.title("DVARS")
+plt.subplot(4,1,4); plt.plot(rDVARS); plt.title("rDVARS")
+plt.tight_layout()
+plt.savefig("$TEMP_PNG", dpi=150)
+plt.close()
+
+###############################################################################
+# tSNR heatmap
+###############################################################################
+tsnr = d.mean(-1) / (d.std(-1) + 1e-6)
+tsnr_val = float(np.median(tsnr))
+tslice = tsnr[:,0,:]
+
+plt.figure(figsize=(12,5))
+plt.subplot(1,2,1)
+im = plt.imshow(tslice.T, origin="lower", aspect="auto")
+plt.colorbar(im); plt.title("tSNR heatmap")
+
+plt.subplot(1,2,2)
+plt.hist(tsnr.reshape(-1), bins=80)
+plt.title(f"tSNR histogram (median={tsnr_val:.2f})")
+plt.tight_layout()
+plt.savefig("$TSNR_PNG", dpi=150)
+plt.close()
+
+###############################################################################
+# SNR, RAW SNR, CNR
+###############################################################################
+raw_snr = raw.mean(-1)/(raw.std(-1)+1e-6)
+raw_snr_val = float(np.median(raw_snr))
+
+baseline = d[...,B1:B2+1]
+snr_clean = baseline.mean(-1)/(baseline.std(-1)+1e-6)
+snr_val = float(np.median(snr_clean))
+
+inj = d[...,S1:S2+1]
+b_mean = baseline.mean(-1); b_std = baseline.std(-1)+1e-6
+i_mean = inj.mean(-1);      i_std = inj.std(-1)+1e-6
+cnr = np.abs(i_mean-b_mean)/np.sqrt(b_std**2+i_std**2)
+cnr_val = float(np.median(cnr))
+
+plt.figure(figsize=(14,8))
+plt.subplot(3,1,1); plt.hist(snr_clean.reshape(-1),bins=80); plt.title(f"SNR clean (median={snr_val:.2f})")
+plt.subplot(3,1,2); plt.hist(raw_snr.reshape(-1),bins=80); plt.title(f"RAW SNR (median={raw_snr_val:.2f})")
+plt.subplot(3,1,3); plt.hist(cnr.reshape(-1),bins=80); plt.title(f"CNR (median={cnr_val:.2f})")
+plt.tight_layout()
+plt.savefig("$SNR_PNG", dpi=150)
+plt.close()
+
+###############################################################################
+# Save QC Values
+###############################################################################
+with open("$QC_TXT","w") as f:
+    f.write(f"Mean PD: {pd_val}\n")
+    f.write(f"Mean CV: {cv_val}\n")
+    f.write(f"Mean AxialV: {axial_val}\n")
+    f.write(f"Median tSNR: {tsnr_val}\n")
+    f.write(f"Median SNR: {snr_val}\n")
+    f.write(f"Median raw SNR: {raw_snr_val}\n")
+    f.write(f"Median CNR: {cnr_val}\n")
+
+print("QC complete → $QC_DIR")
+PY
+
+    msg_ok "Step 6 complete → $QC_DIR"
+fi
+
+###############################################################################
+# STEP 7 — TRIMMING
+###############################################################################
+center "STEP 7 — TRIMMING"
+echo -e "${BOLD}Why?${RESET} Remove unstable initial/final periods."
+
+TRIM_O="$CLEAN_O"
+
+read -p "Skip trimming? (y/n): " SKIP_TRIM
+if [[ "$SKIP_TRIM" != "y" ]]; then
+    echo -e "${BLUE}Select file for trimming:${RESET}"
+
+    mapfile -t FILES < <(find "$SESSION_ANALYSED" -maxdepth 1 -type f -name "*.nii.gz" | sort)
+    for i in "${!FILES[@]}"; do printf "%3d) %s\n" $((i+1)) "$(basename "${FILES[$i]}")"; done
+
+    read -p "Choice: " IDX
+    SELFILE="${FILES[$((IDX-1))]}"
+
+    TR=$(python3 - <<EOF
+import nibabel as nib
+z=nib.load("$SELFILE").header.get_zooms()
+print(1.0 if len(z)<4 else z[3])
+EOF
+)
+    msg_info "TR = $TR s"
+
+    read -p "Trim START seconds: " TS_SEC
+    read -p "Trim END seconds: " TE_SEC
+
+python3 <<PY
+import nibabel as nib, numpy as np
+
+img=nib.load("$SELFILE")
+d=img.get_fdata()
+TR=float("$TR")
+s=int(float("$TS_SEC")/TR)
+e=int(float("$TE_SEC")/TR)
+
+d2 = d[..., s:d.shape[-1]-e]
+out="$SESSION_ANALYSED/trim_$(timestamp).nii.gz"
+nib.save(nib.Nifti1Image(d2.astype(np.float32), img.affine,img.header),out)
+print(out)
+PY
+
+    TRIM_O=$(tail -1 <<< "$(python3 - <<EOF
+print("")
+EOF
+)")
+fi
+
+###############################################################################
+# STEP 8 — SMOOTHING
+###############################################################################
+center "STEP 8 — SMOOTHING"
+echo -e "${BOLD}Why?${RESET} Temporal + spatial smoothing increases SNR."
+
+SMOOTH_DIR="${SESSION_ANALYSED}/SmoothedData"
+mkdir -p "$SMOOTH_DIR"
+
+SMOOTH_O="$TRIM_O"
+
+read -p "Skip smoothing? (y/n): " SKIP_SMOOTH
+if [[ "$SKIP_SMOOTH" != "y" ]]; then
+
+    echo -e "${BLUE}Select file for smoothing:${RESET}"
+    mapfile -t FILES < <(find "$SESSION_ANALYSED" -maxdepth 1 -type f -name "*.nii.gz" | sort)
+    for i in "${!FILES[@]}"; do printf "%3d) %s\n" $((i+1)) "$(basename "${FILES[$i]}")"; done
+
+    read -p "Choice: " IDX
+    SELFILE="${FILES[$((IDX-1))]}"
+
+    TR=$(python3 - <<EOF
+import nibabel as nib
+z=nib.load("$SELFILE").header.get_zooms()
+print(1.0 if len(z)<4 else z[3])
+EOF
+)
+
+    ###############################################
+    # TEMPORAL SMOOTHING
+    ###############################################
+    read -p "Temporal smoothing window (seconds, 0=skip): " TSM
+    if [[ "$TSM" != "0" ]]; then
+
+        TMP="${SMOOTH_DIR}/ts_${TSM}s_$(timestamp).nii.gz"
+
+python3 <<PY
+import nibabel as nib, numpy as np
+from scipy.ndimage import uniform_filter1d
+
+img=nib.load("$SELFILE")
+d=img.get_fdata()
+win=max(1,int(float("$TSM")/float("$TR")))
+out = uniform_filter1d(d, size=win, axis=-1, mode="nearest")
+
+nib.save(nib.Nifti1Image(out.astype(np.float32),img.affine,img.header),"$TMP")
+PY
+
+        msg_ok "Temporal smoothing → $TMP"
+        SELFILE="$TMP"
+    fi
+
+    ###############################################
+    # SPATIAL SMOOTHING
+    ###############################################
+    read -p "Spatial smoothing FWHM (mm, 0=skip): " FWHM
+    if [[ "$FWHM" != "0" ]]; then
+
+        SIG=$(python3 - <<EOF
+import numpy as np
+print(float("$FWHM")/np.sqrt(8*np.log(2)))
+EOF
+)
+
+        TMP="${SMOOTH_DIR}/ss_${FWHM}mm_$(timestamp).nii.gz"
+
+python3 <<PY
+import nibabel as nib, numpy as np
+from scipy.ndimage import gaussian_filter
+
+img=nib.load("$SELFILE")
+d=img.get_fdata()
+sigma=float("$SIG")
+
+out=np.stack([gaussian_filter(d[...,t],sigma)
+              for t in range(d.shape[-1])],axis=-1)
+
+nib.save(nib.Nifti1Image(out.astype(np.float32),img.affine,img.header),"$TMP")
+PY
+
+        SMOOTH_O="$TMP"
+    else
+        SMOOTH_O="$SELFILE"
+    fi
+fi
+
+msg_ok "Smoothing output → $SMOOTH_O"
+
+###############################################################################
+# END PART 2
+###############################################################################
+msg_ok "Part 2/4 complete — ready for scrubbing."
+###############################################################################
+# STEP 9 — SCRUBBING (rGS / rDVARS strict thresholds)
+###############################################################################
+center "STEP 9 — SCRUBBING"
+echo -e "${BOLD}Why?${RESET} Remove motion-contaminated frames using strict QC thresholds."
+
+SCRUB_DIR="${SESSION_ANALYSED}/ScrubbedData"
+mkdir -p "$SCRUB_DIR"
+
+SCRUB_O="$SMOOTH_O"
+
+read -p "Skip scrubbing? (y/n): " SKIP_SCRUB
+if [[ "$SKIP_SCRUB" != "y" ]]; then
+
+    echo -e "${BLUE}Computing rGS / rDVARS for scrubbing...${RESET}"
+
+python3 <<PY
+import numpy as np, nibabel as nib, matplotlib.pyplot as plt
+import os
+
+img = nib.load("$SMOOTH_O")
+d = img.get_fdata()
+T = d.shape[-1]
+flat = d.reshape(-1, T)
+
+# GLOBAL SIGNAL
+gs = flat.mean(0)
+D1 = np.percentile(gs, 10)
+rGS = 100 * (gs - D1) / (D1 + 1e-6)
+
+# DVARS & rDVARS
+diff = np.diff(flat, 1, 1)
+DVARS = np.sqrt((diff**2).mean(0))
+
+p25,p75 = np.percentile(flat,[25,75],axis=1)
+iqr = p75 - p25
+sigma = iqr / 1.349
+mu0 = np.sqrt((2*sigma**2).mean())
+
+rDVARS = DVARS/(mu0+1e-6)
+
+# Strict thresholds (from paper)
+th_rGS = 10      # %
+th_rDVARS = 2.0  # ratio
+
+bad = np.where((rGS > th_rGS) | (rDVARS > th_rDVARS))[0]
+good = np.setdiff1d(np.arange(T), bad)
+
+print("Bad volumes:", bad)
+print("Good volumes:", good)
+
+# Replace bad volumes with mean of good (paper method)
+d2 = d.copy()
+mean_good = d[..., good].mean(-1)
+
+for b in bad:
+    d2[..., b] = mean_good
+
+# Save scrubbed file
+out = "$SCRUB_DIR/scrubbed_$(timestamp).nii.gz"
+nib.save(nib.Nifti1Image(d2.astype(np.float32), img.affine, img.header), out)
+print(out)
+PY
+
+    # Capture output
+    SCRUB_O=$(tail -1 <<< "$(python3 - <<EOF
+print("")
+EOF
+)")
+    msg_ok "Scrubbed dataset saved → $SCRUB_O"
+else
+    msg_skip "Scrubbing skipped."
+fi
+
+
+###############################################################################
+# STEP 10 — FREQUENCY FILTERING (Butterworth)
+###############################################################################
+center "STEP 10 — FREQUENCY FILTERING"
+echo -e "${BOLD}Why?${RESET} Remove drift and keep relevant hemodynamic frequencies."
+
+FILT_DIR="${SESSION_ANALYSED}/FilteredData"
+mkdir -p "$FILT_DIR"
+
+read -p "Skip frequency filtering? (y/n): " SKIP_FILT
+if [[ "$SKIP_FILT" != "y" ]]; then
+
+    echo -e "${BLUE}Select filter type:${RESET}"
+    echo "1) High-pass"
+    echo "2) Low-pass"
+    echo "3) Band-pass"
+    echo "4) Notch"
+    read -p "Choice: " FTYPE
+
+    HP=0; LP=0; BP1=0; BP2=0; NC=0; NW=0
+
+    case $FTYPE in
+        1) read -p "High-pass cutoff (Hz): " HP;;
+        2) read -p "Low-pass cutoff (Hz): " LP;;
+        3) read -p "Band-pass LOW  (Hz): " BP1
+           read -p "Band-pass HIGH (Hz): " BP2;;
+        4) read -p "Notch center (Hz): " NC
+           read -p "Notch width  (Hz): " NW;;
+    esac
+
+    TR=$(python3 - <<EOF
+import nibabel as nib
+z=nib.load("$SCRUB_O").header.get_zooms()
+print(1.0 if len(z)<4 else z[3])
+EOF
+)
+
+    FILT_O="${FILT_DIR}/filt_${FTYPE}_$(timestamp).nii.gz"
+
+python3 <<PY
+import numpy as np, nibabel as nib
+from scipy.signal import butter, filtfilt
+
+fname = "$SCRUB_O"
+out   = "$FILT_O"
+ftype = "$FTYPE"
+
+img=nib.load(fname)
+d=img.get_fdata()
+X,Y,Z,T=d.shape
+flat=d.reshape(-1,T)
+
+TR=float("$TR")
+nyq=0.5/TR
+
+HP=float("$HP"); LP=float("$LP")
+BP1=float("$BP1"); BP2=float("$BP2")
+NC=float("$NC"); NW=float("$NW")
+
+if ftype=="1":
+    b,a=butter(6, HP/nyq, btype="highpass")
+elif ftype=="2":
+    b,a=butter(6, LP/nyq, btype="lowpass")
+elif ftype=="3":
+    b,a=butter(6, [BP1/nyq, BP2/nyq], btype="bandpass")
+elif ftype=="4":
+    lo=(NC-NW/2)/nyq
+    hi=(NC+NW/2)/nyq
+    b,a=butter(6, [lo, hi], btype="bandstop")
+else:
+    raise RuntimeError("Invalid filter type")
+
+def safe(x):
+    if not np.isfinite(x).all() or x.std()<1e-8:
+        return x
+    try:
+        return filtfilt(b,a,x,axis=-1,method="gust")
+    except:
+        return x
+
+filt = np.vstack([safe(v) for v in flat]).reshape(X,Y,Z,T)
+nib.save(nib.Nifti1Image(filt.astype(np.float32), img.affine, img.header), out)
+PY
+
+    msg_ok "Filtering complete → $FILT_O"
+else
+    msg_skip "Filtering skipped."
+    FILT_O="$SCRUB_O"
+fi
+
+
+###############################################################################
+# STEP 11 — CONFOUND REGRESSION + PCA
+###############################################################################
+center "STEP 11 — CONFOUND REGRESSION + PCA"
+echo -e "${BOLD}Why?${RESET} Remove global/physiological/motion-like confounds, then remove PCA noise."
+
+CR_DIR="${SESSION_ANALYSED}/ConfoundRegression"
+mkdir -p "$CR_DIR"
+
+##############################################
+# SELECT CONFOUND METHOD
+##############################################
+echo -e "${BLUE}Select confound regression method:${RESET}"
+echo "1) None"
+echo "2) Global Signal Regression (GSR)"
+echo "3) tCompCor (5 components)"
+echo "4) aCompCor (5 components, WM+CSF mask)"
+echo "5) Random CompCor (5 components)"
+echo "6) Low-variance CompCor (5 components)"
+read -p "Choice: " CTYPE
+
+CONF_O="$FILT_O"
+
+if [[ "$CTYPE" != "1" ]]; then
+    CONF_O="${CR_DIR}/confreg_${CTYPE}_$(timestamp).nii.gz"
+
+    # If aCompCor selected → need WM+CSF mask
+    if [[ "$CTYPE" == "4" ]]; then
+        echo -e "${PURPLE}[ACTION REQUIRED]${RESET}"
+        echo "Please OPEN the mean image:"
+        echo "  $MEAN_O"
+        echo "Draw WM mask → save as: $SESSION_ANALYSED/wm_mask.nii.gz"
+        echo "Draw CSF mask → save as: $SESSION_ANALYSED/csf_mask.nii.gz"
+        echo "Waiting..."
+        while [[ ! -f "$SESSION_ANALYSED/wm_mask.nii.gz" || ! -f "$SESSION_ANALYSED/csf_mask.nii.gz" ]]; do sleep 2; done
+    fi
+
+python3 <<PY
+import nibabel as nib, numpy as np
+from sklearn.decomposition import PCA
+
+ctype = int("$CTYPE")
+img = nib.load("$FILT_O")
+d = img.get_fdata()
+X,Y,Z,T = d.shape
+flat = d.reshape(-1,T)
+
+###############################################################################
+# 1) BUILD CONFOUND REGRESSORS
+###############################################################################
+def zscore(x): return (x - x.mean()) / (x.std() + 1e-6)
+
+regs = []
+
+if ctype == 2:      # GSR
+    g = flat.mean(0)
+    regs.append(zscore(g))
+
+elif ctype == 3:    # tCompCor
+    std = flat.std(1)
+    n = int(0.05*len(std))
+    idx = np.argsort(std)[-n:]
+    Xroi = flat[idx].T
+    C = PCA(n_components=5).fit_transform(Xroi)
+    regs.extend([zscore(C[:,i]) for i in range(C.shape[1])])
+
+elif ctype == 4:    # aCompCor
+    wm = nib.load("$SESSION_ANALYSED/wm_mask.nii.gz").get_fdata()>0
+    csf = nib.load("$SESSION_ANALYSED/csf_mask.nii.gz").get_fdata()>0
+    mask = (wm | csf).reshape(-1)
+    Xroi = flat[mask].T
+    C = PCA(n_components=5).fit_transform(Xroi)
+    regs.extend([zscore(C[:,i]) for i in range(5)])
+
+elif ctype == 5:    # Random CompCor
+    N = np.sum(np.load("$SESSION_ANALYSED/wm_mask.nii.gz").reshape(-1)>0)
+    idx = np.random.choice(flat.shape[0], N, replace=False)
+    Xroi = flat[idx].T
+    C = PCA(n_components=5).fit_transform(Xroi)
+    regs.extend([zscore(C[:,i]) for i in range(5)])
+
+elif ctype == 6:    # Low-variance CompCor
+    std = flat.std(1)
+    N = np.sum(np.load("$SESSION_ANALYSED/wm_mask.nii.gz").reshape(-1)>0)
+    idx = np.argsort(std)[:N]
+    Xroi = flat[idx].T
+    C = PCA(n_components=5).fit_transform(Xroi)
+    regs.extend([zscore(C[:,i]) for i in range(5)])
+
+###############################################################################
+# 2) APPLY OLS regression
+###############################################################################
+if len(regs) > 0:
+    R = np.vstack(regs).T      # shape: T × k
+    R = np.hstack([R, np.ones((T,1))])  # add intercept
+
+    beta = np.linalg.lstsq(R, flat.T, rcond=None)[0] 
+    pred = R @ beta
+    clean = flat - pred.T
+else:
+    clean = flat
+
+clean_4d = clean.reshape(X,Y,Z,T)
+nib.save(nib.Nifti1Image(clean_4d.astype(np.float32), img.affine, img.header),
+         "$CONF_O")
+print("Saved confound-regressed → $CONF_O")
+PY
+
+    msg_ok "Confound regression complete → $CONF_O"
+else
+    msg_skip "No confound regression selected."
+fi
+
+##############################################
+# PCA DENOISING (interactive)
+##############################################
+PCA_DIR="${SESSION_ANALYSED}/PCA_$(timestamp)"
+mkdir -p "$PCA_DIR"
+PCA_OUT="$PCA_DIR/pca_denoised.nii.gz"
+PCA_GRID="$PCA_DIR/pca_components.png"
+
+python3 <<'PY'
+import numpy as np, nibabel as nib, matplotlib.pyplot as plt, os
+from sklearn.decomposition import PCA
+
+fname = """'"$CONF_O"'" 
+outname = """'"$PCA_OUT"'" 
+gridpng = """'"$PCA_GRID"'" 
+pcadir = """'"$PCA_DIR"'" 
+
+img=nib.load(fname)
+d=img.get_fdata().astype(np.float32)
+X,Y,Z,T=d.shape
+
+flat = d.reshape(-1,T)
+p = PCA(n_components=min(40,T))
+C = p.fit_transform(flat.T)
+
+drop=set()
+
+fig,axes=plt.subplots(4,10,figsize=(20,8))
+axes=axes.ravel()
+
+def refresh(idx):
+    ax=axes[idx]
+    t=(C[:,idx]-C[:,idx].mean())/(C[:,idx].std()+1e-6)
+    ax.clear()
+    ax.plot(t,'r' if idx in drop else 'k',lw=0.7)
+    ax.set_title(f"C{idx+1} {'✗' if idx in drop else ''}")
+    ax.set_xticks([]); ax.set_yticks([])
+
+for i in range(min(40,C.shape[1])):
+    refresh(i)
+
+def onclick(ev):
+    if ev.inaxes in axes:
+        idx=list(axes).index(ev.inaxes)
+        drop.remove(idx) if idx in drop else drop.add(idx)
+        refresh(idx)
+        fig.canvas.draw_idle()
+
+def onkey(ev):
+    if ev.key=="enter":
+        plt.savefig(gridpng, dpi=150)
+        print("[OK] PCA grid saved.")
+        plt.close()
+
+fig.canvas.mpl_connect("button_press_event",onclick)
+fig.canvas.mpl_connect("key_press_event",onkey)
+plt.suptitle("PCA — Click to DROP components, ENTER to finish",fontsize=14)
+plt.tight_layout()
+plt.show()
+
+# Apply PCA denoising
+for idx in drop:
+    C[:,idx]=0
+
+recon = p.inverse_transform(C).T.reshape(X,Y,Z,T)
+
+nib.save(nib.Nifti1Image(recon.astype(np.float32), img.affine, img.header),
+         outname)
+print("[OK] PCA denoised file saved:", outname)
+PY
+
+msg_ok "PCA done → $PCA_OUT"
+
+###############################################################################
+# STEP 11 (continued) — SCM after PCA
+###############################################################################
+echo -e "${BLUE}Select baseline & signal windows for SCM (post-PCA).${RESET}"
+
+python3 <<PY
+import nibabel as nib, numpy as np, matplotlib.pyplot as plt
+
+img=nib.load("$PCA_OUT")
+d=img.get_fdata()
+sig=d.reshape(-1,d.shape[-1]).mean(0)
+
+plt.figure(figsize=(10,3))
+plt.plot(sig,'k')
+plt.title("Global Mean — Select SCM windows")
+plt.grid(alpha=0.3)
+plt.show()
+PY
+
+read -p "Baseline START END: " PB1 PB2
+read -p "Signal   START END: " PS1 PS2
+
+SCM_PCA="${PCA_DIR}/SCM_${PB1}-${PB2}_${PS1}-${PS2}"
+mkdir -p "$SCM_PCA"
+
+python3 <<PY
+import nibabel as nib, numpy as np
+
+img=nib.load("$PCA_OUT")
+d=img.get_fdata()
+aff=img.affine; hdr=img.header
+
+b1,b2 = int("$PB1"), int("$PB2")
+s1,s2 = int("$PS1"), int("$PS2")
+
+baseline = d[...,b1:b2+1].mean(-1)
+signal   = d[...,s1:s2+1].mean(-1)
+psc      = ((signal-baseline)/(baseline+1e-6))*100
+norm     = (d-baseline[...,None])/(baseline[...,None]+1e-6)
+
+nib.save(nib.Nifti1Image(baseline.astype(np.float32),aff,hdr),f"{SCM_PCA}/baseline.nii.gz")
+nib.save(nib.Nifti1Image(signal.astype(np.float32),aff,hdr),  f"{SCM_PCA}/signal.nii.gz")
+nib.save(nib.Nifti1Image(psc.astype(np.float32),aff,hdr),     f"{SCM_PCA}/signal_change_map.nii.gz")
+nib.save(nib.Nifti1Image(norm.astype(np.float32),aff,hdr),    f"{SCM_PCA}/norm_func.nii.gz")
+PY
+
+nohup fsleyes \
+    "$SCM_PCA/norm_func.nii.gz" \
+    "$SCM_PCA/baseline.nii.gz" \
+    "$SCM_PCA/signal_change_map.nii.gz" >/dev/null 2>&1 &
+
+msg_ok "SCM after PCA saved → $SCM_PCA"
+
+###############################################################################
+# END PART 3
+###############################################################################
+msg_ok "Part 3/4 complete — ready for QC Summary + CSV LOG."
+###############################################################################
+# STEP 12 — QC SUMMARY (HTML)
+###############################################################################
+center "STEP 12 — QC SUMMARY"
+echo -e "${BOLD}Why?${RESET} Combine all QC outputs (frequency, spatial, temporal, PCA, SCM)."
+
+QC_HTML="${SESSION_ANALYSED}/QC_summary_$(timestamp).html"
+
+python3 <<PY
+import os, glob, datetime
+
+root = "$SESSION_ANALYSED"
+html = []
+
+html.append("<html><head><meta charset='UTF-8'>")
+html.append("<style> body{background:#111;color:#eee;font-family:Arial;padding:20px;} ")
+html.append("h1,h2{color:#66ccff;} h3{color:#ccc;} img{margin-bottom:20px;border:2px solid #333;} </style></head><body>")
+
+html.append("<h1>fUSI QC SUMMARY</h1>")
+html.append("<p>Generated: %s</p>" % datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+# ------------------------------------------------------------
+# QC DIR
+# ------------------------------------------------------------
+html.append("<h2>QC: Frequency / Temporal / Spatial / SNR / tSNR</h2>")
+qc = root + "/QC"
+for f in sorted(glob.glob(qc + "/*.png")):
+    bn = os.path.basename(f)
+    html.append(f"<h3>{bn}</h3>")
+    html.append(f"<img src='{f}' width='700'>")
+
+valtxt = qc + "/qc_values.txt"
+if os.path.exists(valtxt):
+    html.append("<h3>QC VALUES</h3><pre>")
+    html.append(open(valtxt).read())
+    html.append("</pre>")
+
+# ------------------------------------------------------------
+# SCM outputs
+# ------------------------------------------------------------
+html.append("<h2>SCM Outputs</h2>")
+for folder in sorted(glob.glob(root + "/SCM_*")):
+    html.append(f"<h3>{os.path.basename(folder)}</h3>")
+    for nii in sorted(glob.glob(folder + "/*.nii.gz")):
+        html.append(f"<p>{os.path.basename(nii)}")
+
+# ------------------------------------------------------------
+# PCA QC
+# ------------------------------------------------------------
+html.append("<h2>PCA Outputs</h2>")
+for grid in sorted(glob.glob(root + "/PCA_*/pca_components.png")):
+    bn = os.path.basename(grid)
+    html.append(f"<h3>{bn}</h3>")
+    html.append(f"<img src='{grid}' width='700'>")
+
+# PCA SCMs
+for folder in sorted(glob.glob(root + "/PCA_*/SCM_*")):
+    html.append(f"<h3>{os.path.basename(folder)}</h3>")
+    for nii in sorted(glob.glob(folder + "/*.nii.gz")):
+        html.append(f"<p>{os.path.basename(nii)}")
+
+html.append("</body></html>")
+
+open("$QC_HTML","w").write("\n".join(html))
+print("Saved summary →", "$QC_HTML")
+PY
+
+msg_ok "QC Summary saved → $QC_HTML"
+
+
+###############################################################################
+# STEP 13 — CSV PROCESSING LOG
+###############################################################################
+center "STEP 13 — PROCESSING LOG (.CSV)"
+echo -e "${BOLD}Why?${RESET} Ensure reproducibility — record every generated file."
+
+read -p "Save CSV processing log? (y/n): " SAVELOG
+if [[ "$SAVELOG" == "y" ]]; then
+
+    LOG="${SESSION_ANALYSED}/processing_log_$(timestamp).csv"
+    echo "Timestamp,File" > "$LOG"
+
+    # Top-level NIfTI files
+    for f in "$SESSION_ANALYSED"/*.nii.gz; do
+        [[ -f "$f" ]] || continue
+        echo "$(timestamp),$(basename "$f")" >> "$LOG"
+    done
+
+    # Recursively add subfolder files
+    while IFS= read -r file; do
+        rel="${file#$SESSION_ANALYSED/}"
+        echo "$(timestamp),$rel" >> "$LOG"
+    done < <(find "$SESSION_ANALYSED" -type f \( -name "*.nii.gz" -o -name "*.png" -o -name "*.txt" -o -name "*.html" \) | sort)
+
+    msg_ok "CSV log saved → $LOG"
+else
+    msg_skip "CSV log skipped."
+fi
+
+
+###############################################################################
+# PIPELINE COMPLETE
+###############################################################################
+center "PIPELINE COMPLETE"
+echo -e "${GREEN}All processing steps finished successfully.${RESET}"
+echo -e "QC Summary → ${CYAN}$QC_HTML${RESET}"
