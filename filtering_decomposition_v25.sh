@@ -497,6 +497,74 @@ if [[ "$DO_DET" == "y" ]]; then
     fi
 fi
 
+###############################################################################
+# FUNCTION: scm_blush_fast
+#
+# Computes baseline, signal, PSC map, and norm_func quickly using Python.
+#
+# INPUTS:
+#   1 = NIfTI file
+#   2 = baseline_start
+#   3 = baseline_end
+#   4 = signal_start
+#   5 = signal_end
+#   6 = mask ("" allowed)
+#   7 = output folder
+###############################################################################
+scm_blush_fast(){
+  local nii="$1"
+  local b1="$2"
+  local b2="$3"
+  local s1="$4"
+  local s2="$5"
+  local mask="$6"
+  local outdir="$7"
+
+python3 - "$nii" "$b1" "$b2" "$s1" "$s2" "$mask" "$outdir" <<'PY'
+import sys, os, nibabel as nib, numpy as np
+
+nii, b1, b2, s1, s2, mask, outdir = sys.argv[1:]
+b1=int(b1); b2=int(b2); s1=int(s1); s2=int(s2)
+
+img=nib.load(nii)
+d=img.get_fdata()
+aff=img.affine
+hdr=img.header
+
+if d.ndim!=4:
+    print("[ERR] SCM requires 4D data.")
+    sys.exit(1)
+
+# Apply mask if provided
+if mask and os.path.exists(mask):
+    m = nib.load(mask).get_fdata()>0
+    d = d * m[...,None]
+
+# Compute baseline and signal means
+baseline = d[..., b1:b2+1].mean(axis=3)
+signal   = d[..., s1:s2+1].mean(axis=3)
+
+# Percent signal change map
+psc = 100 * (signal - baseline) / (baseline + 1e-8)
+
+# norm_func
+norm = (d - baseline[...,None]) / (baseline[...,None] + 1e-8)
+
+# Save all outputs
+np.set_printoptions(suppress=True)
+
+nib.save(nib.Nifti1Image(baseline.astype(np.float32),aff,hdr),
+         f"{outdir}/baseline_{b1}_{b2}.nii.gz")
+nib.save(nib.Nifti1Image(signal.astype(np.float32),aff,hdr),
+         f"{outdir}/signal_{b1}_{b2}.nii.gz")
+nib.save(nib.Nifti1Image(psc.astype(np.float32),aff,hdr),
+         f"{outdir}/signal_change_map_{b1}_{b2}_{s1}_{s2}.nii.gz")
+nib.save(nib.Nifti1Image(norm.astype(np.float32),aff,hdr),
+         f"{outdir}/norm_func_{b1}_{b2}.nii.gz")
+
+print("[OK] SCM outputs written to", outdir)
+PY
+}
 
 
 ###############################################################################
@@ -1174,4 +1242,3 @@ except Exception as e:
     print("[WARN] Could not auto-open HTML:",e)
 
 PY
-
